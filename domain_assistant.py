@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -243,27 +243,81 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
+    """Generate answers with OpenAI, or an OpenAI-compatible endpoint.
+
+    When OPENAI_BASE_URL is set (e.g. the Gemini OpenAI-compatibility
+    endpoint), the Chat Completions API is used because such endpoints do not
+    implement the Responses API. Retrieval and the prompt are unchanged.
+    """
+
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        self.base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+        self.reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "").strip() or None
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        # Free-tier compatible endpoints rate-limit aggressively; allow more
+        # SDK retries (exponential backoff on 429/5xx) in that mode.
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            max_retries=6 if self.base_url else 2,
+        )
         self.max_output_tokens = max_output_tokens
+        # Minimum seconds between requests, to stay under per-minute quotas
+        # (Gemini free tier allows 5 requests/minute -> 13s is safe).
+        self.min_interval = float(os.getenv("OPENAI_MIN_REQUEST_INTERVAL", "0") or 0)
+        self._last_request_at = 0.0
+
+    def _wait_for_rate_limit(self) -> None:
+        wait = self.min_interval - (time.monotonic() - self._last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_at = time.monotonic()
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        if self.base_url:
+            answer = self._generate_chat_completion(prompt)
+        else:
+            response = self.client.responses.create(
+                model=self.model,
+                input=prompt,
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            )
+            answer = response.output_text.strip()
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
+
+    def _generate_chat_completion(self, prompt: str) -> str:
+        options: dict[str, Any] = {}
+        if self.reasoning_effort:
+            # Stops "thinking" models from spending the output budget on
+            # hidden reasoning tokens.
+            options["reasoning_effort"] = self.reasoning_effort
+        for attempt in range(4):
+            self._wait_for_rate_limit()
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                    **options,
+                )
+                break
+            except RateLimitError:
+                if attempt == 3:
+                    raise
+                # Per-minute quota windows reset within a minute.
+                time.sleep(60)
+        if not response.choices:
+            return ""
+        return (response.choices[0].message.content or "").strip()
 
 
 @dataclass(frozen=True)
